@@ -1,0 +1,77 @@
+#include <SPI.h>
+#include <RF24.h>
+
+RF24 radio(9, 10);
+const byte endereco[6] = "DRONE";
+
+// Pinos dos joysticks
+const int pinoThrottle = A0;
+const int pinoYaw      = A1;
+const int pinoPitch    = A2;
+const int pinoRoll     = A3;
+
+const int botaoArmar = 2;
+
+// Dados enviados para o drone
+struct Controle {
+  int throttle;
+  int pitch;
+  int roll;
+  int yaw;
+  bool armado;
+};
+
+Controle controle;
+
+int lerCanalCentralizado(int pino) {
+  int leitura = analogRead(pino);
+  int valor = map(leitura, 0, 1023, -500, 500);
+
+  // Evito pequenas variações quando o joystick está parado
+  if (valor > -30 && valor < 30) {
+    valor = 0;
+  }
+
+  return valor;
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(botaoArmar, INPUT_PULLUP);
+
+  radio.begin();
+  radio.openWritingPipe(endereco);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_250KBPS);
+  radio.stopListening();
+
+  Serial.println("Controle iniciado.");
+}
+
+void loop() {
+  int leituraThrottle = analogRead(pinoThrottle);
+
+  controle.throttle = map(leituraThrottle, 0, 1023, 0, 1000);
+  controle.yaw      = lerCanalCentralizado(pinoYaw);
+  controle.pitch    = lerCanalCentralizado(pinoPitch);
+  controle.roll     = lerCanalCentralizado(pinoRoll);
+
+  // Botão pressionado arma o drone
+  controle.armado = digitalRead(botaoArmar) == LOW;
+
+  radio.write(&controle, sizeof(controle));
+
+  Serial.print("Throttle: ");
+  Serial.print(controle.throttle);
+  Serial.print(" | Pitch: ");
+  Serial.print(controle.pitch);
+  Serial.print(" | Roll: ");
+  Serial.print(controle.roll);
+  Serial.print(" | Yaw: ");
+  Serial.print(controle.yaw);
+  Serial.print(" | Armado: ");
+  Serial.println(controle.armado);
+
+  delay(20);
+}

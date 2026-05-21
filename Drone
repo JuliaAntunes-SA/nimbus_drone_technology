@@ -1,0 +1,190 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <RF24.h>
+#include <MPU6050.h>
+
+RF24 radio(9, 10);
+const byte endereco[6] = "DRONE";
+
+MPU6050 mpu;
+
+// Pinos dos motores
+const int motorFrenteEsquerda = 3;
+const int motorFrenteDireita  = 5;
+const int motorTrasEsquerda   = 6;
+const int motorTrasDireita    = 11;
+
+// Dados recebidos do controle
+struct Controle {
+  int throttle; 
+  int pitch;
+  int roll;
+  int yaw;
+  bool armado;
+};
+
+Controle controle;
+
+// Variáveis do MPU6050
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+
+float anguloPitch = 0;
+float anguloRoll = 0;
+
+unsigned long tempoAnterior = 0;
+float dt = 0;
+
+// Ajustes básicos do PID
+float kpPitch = 1.5;
+float kiPitch = 0.0;
+float kdPitch = 0.8;
+
+float kpRoll = 1.5;
+float kiRoll = 0.0;
+float kdRoll = 0.8;
+
+float erroPitchAnterior = 0;
+float integralPitch = 0;
+
+float erroRollAnterior = 0;
+float integralRoll = 0;
+
+float calcularPID(float alvo, float atual, float &erroAnterior, float &integral, float kp, float ki, float kd) {
+  float erro = alvo - atual;
+  integral += erro * dt;
+
+  float derivada = (erro - erroAnterior) / dt;
+  erroAnterior = erro;
+
+  return (kp * erro) + (ki * integral) + (kd * derivada);
+}
+
+int limitarPWM(int valor) {
+  if (valor < 0) return 0;
+  if (valor > 255) return 255;
+  return valor;
+}
+
+int converterThrottle(int throttle) {
+  throttle = constrain(throttle, 0, 1000);
+  return map(throttle, 0, 1000, 0, 255);
+}
+
+void pararMotores() {
+  analogWrite(motorFrenteEsquerda, 0);
+  analogWrite(motorFrenteDireita, 0);
+  analogWrite(motorTrasEsquerda, 0);
+  analogWrite(motorTrasDireita, 0);
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(motorFrenteEsquerda, OUTPUT);
+  pinMode(motorFrenteDireita, OUTPUT);
+  pinMode(motorTrasEsquerda, OUTPUT);
+  pinMode(motorTrasDireita, OUTPUT);
+
+  pararMotores();
+
+  Wire.begin();
+  mpu.initialize();
+
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 nao encontrado.");
+    while (true) {
+      pararMotores();
+    }
+  }
+
+  radio.begin();
+  radio.openReadingPipe(0, endereco);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_250KBPS);
+  radio.startListening();
+
+  controle.throttle = 0;
+  controle.pitch = 0;
+  controle.roll = 0;
+  controle.yaw = 0;
+  controle.armado = false;
+
+  tempoAnterior = micros();
+
+  Serial.println("Drone iniciado.");
+}
+
+void loop() {
+  unsigned long tempoAtual = micros();
+  dt = (tempoAtual - tempoAnterior) / 1000000.0;
+  tempoAnterior = tempoAtual;
+
+  if (dt <= 0) {
+    dt = 0.001;
+  }
+
+  // Recebo os comandos do controle remoto
+  if (radio.available()) {
+    radio.read(&controle, sizeof(controle));
+  }
+
+  // Se o drone não estiver armado, mantenho os motores desligados
+  if (!controle.armado) {
+    pararMotores();
+    integralPitch = 0;
+    integralRoll = 0;
+    return;
+  }
+
+  // Leio os dados do sensor
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  float pitchAccel = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+  float rollAccel  = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+  float gyroPitch = gx / 131.0;
+  float gyroRoll  = gy / 131.0;
+
+  // Combino giroscópio e acelerômetro para estimar a inclinação
+  anguloPitch = 0.98 * (anguloPitch + gyroPitch * dt) + 0.02 * pitchAccel;
+  anguloRoll  = 0.98 * (anguloRoll  + gyroRoll  * dt) + 0.02 * rollAccel;
+
+  float alvoPitch = map(controle.pitch, -500, 500, -20, 20);
+  float alvoRoll  = map(controle.roll,  -500, 500, -20, 20);
+
+  // Calculo as correções para estabilizar o drone
+  float correcaoPitch = calcularPID(alvoPitch, anguloPitch, erroPitchAnterior, integralPitch, kpPitch, kiPitch, kdPitch);
+  float correcaoRoll  = calcularPID(alvoRoll,  anguloRoll,  erroRollAnterior,  integralRoll,  kpRoll,  kiRoll,  kdRoll);
+
+  int baseThrottle = converterThrottle(controle.throttle);
+
+  // Distribuo a potência entre os quatro motores
+  int mFE = baseThrottle + correcaoPitch + correcaoRoll;
+  int mFD = baseThrottle + correcaoPitch - correcaoRoll;
+  int mTE = baseThrottle - correcaoPitch + correcaoRoll;
+  int mTD = baseThrottle - correcaoPitch - correcaoRoll;
+
+  mFE = limitarPWM(mFE);
+  mFD = limitarPWM(mFD);
+  mTE = limitarPWM(mTE);
+  mTD = limitarPWM(mTD);
+
+  analogWrite(motorFrenteEsquerda, mFE);
+  analogWrite(motorFrenteDireita,  mFD);
+  analogWrite(motorTrasEsquerda,   mTE);
+  analogWrite(motorTrasDireita,    mTD);
+
+  Serial.print("Pitch: ");
+  Serial.print(anguloPitch);
+  Serial.print(" | Roll: ");
+  Serial.print(anguloRoll);
+  Serial.print(" | Motores: ");
+  Serial.print(mFE);
+  Serial.print(" ");
+  Serial.print(mFD);
+  Serial.print(" ");
+  Serial.print(mTE);
+  Serial.print(" ");
+  Serial.println(mTD);
+}
